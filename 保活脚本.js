@@ -1,11 +1,23 @@
-function ClickConnect() {
-    console.log("💓 [Colab Keep-Alive] 触发前端防断连心跳 - " + new Date().toLocaleTimeString());
-    // 点击顶部连接状态按钮两次（展开再收起），向 Colab 前端派发真实 DOM 交互事件
-    const connectBtn = document.querySelector("colab-connect-button") || document.querySelector("#top-toolbar colab-connect-button");
-    if (connectBtn && connectBtn.shadowRoot) {
-        const btn = connectBtn.shadowRoot.querySelector("#connect");
-        if (btn) { btn.click(); setTimeout(() => btn.click(), 500); }
+function keepAlive() {
+    console.log("🟢 [Colab Keep-Alive] 正在触发活跃点击...");
+    
+    // 尝试寻找 Colab 的连接按钮并点击
+    const connectButton = document.querySelector("colab-connect-button");
+    if (connectButton && connectButton.shadowRoot) {
+        const btn = connectButton.shadowRoot.querySelector("#connect");
+        if (btn) {
+            btn.click();
+            return;
+        }
     }
-    // 自动点击可能弹出的“您仍在吗？”确认框
-    const okBtn = document.querySelector("mwc-button[slot='primaryAction']") || document.querySelector("paper-button#ok");
+    
+    // 备用方案：点击顶部工具栏的连接状态
+    const toolbarBtn = document.querySelector("#top-toolbar > colab-connect-button");
+    if (toolbarBtn) {
+        toolbarBtn.click();
+    }
 }
+
+// 每 60,000 毫秒（60秒）执行一次
+const keepAliveInterval = setInterval(keepAlive, 60000);
+console.log("✅ Colab 保活脚本已启动！如果要停止，请在控制台输入: clearInterval(" + keepAliveInterval + ")");
