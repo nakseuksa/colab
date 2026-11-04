@@ -8,3 +8,4 @@ function ClickConnect() {
     }
     // 自动点击可能弹出的“您仍在吗？”确认框
     const okBtn = document.querySelector("mwc-button[slot='primaryAction']") || document.querySelector("paper-button#ok");
+}
