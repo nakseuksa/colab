@@ -9,7 +9,7 @@ RUN_SANITY_TEST = False
 @torch.inference_mode()
 def chat_qwen38(
     prompt: str,
-    system_prompt: str = "You are a helpful assistant.",
+    system_prompt: str = "你是一个专业、乐于助人的 AI 助手，请始终使用简体中文回答用户问题。",
     enable_thinking: bool = True,
     reasoning_effort: str = "low",  # 测试建议用 "low"，可选: "low" | "medium" | "xhigh"
     max_new_tokens: int = 2048,
