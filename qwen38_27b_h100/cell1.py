@@ -18,20 +18,32 @@ CORE_DEPENDENCIES = [
 ]
 
 
+ALLOW_INTERACTIVE_MOUNT = os.environ.get("COLAB_AUTO_MOUNT_DRIVE", "0").strip().lower() in ("1", "true", "yes")
+SKIP_PIP_INSTALL = os.environ.get("SKIP_PIP_INSTALL", "0").strip().lower() in ("1", "true", "yes")
+
+
 def mount_google_drive(mount_point: str = "/content/drive") -> bool:
-    """幂等挂载 Google Drive，失败时优雅降级返回 False。"""
+    """幂等检测/挂载 Google Drive。CLI 模式下默认跳过阻塞式交互挂载，失败时优雅降级返回 False。"""
     if os.path.ismount(mount_point):
-        print("✅ 检测到 Google Drive 已挂载，直接复用！")
+        print("✅ 检测到 Google Drive 已挂载，直接复用！", flush=True)
         return True
+
+    if not ALLOW_INTERACTIVE_MOUNT:
+        print(
+            f"ℹ️ 未检测到已挂载的 Google Drive ({mount_point})，已切换为本地临时目录缓存。\n"
+            "   （如需云盘持久化，请先在终端运行: colab drivemount -s <session>）",
+            flush=True,
+        )
+        return False
 
     try:
         from google.colab import drive
 
         drive.mount(mount_point, force_remount=True)
-        print("✅ Google Drive 挂载成功！")
+        print("✅ Google Drive 挂载成功！", flush=True)
         return True
     except Exception as exc:
-        print(f"⚠️ Google Drive 挂载失败 ({exc})，已自动切换为本地临时目录缓存。")
+        print(f"⚠️ Google Drive 挂载失败 ({exc})，已自动切换为本地临时目录缓存。", flush=True)
         return False
 
 
@@ -127,22 +139,36 @@ def configure_persistent_caches(
     return {**cache_dirs, "BASE_CACHE_DIR": base_cache_dir}
 
 
-def install_dependencies(packages: list | None = None) -> subprocess.CompletedProcess:
-    """使用 subprocess.run 安装 vLLM 与网关核心依赖。"""
-    pkg_list = list(packages) if packages is not None else list(CORE_DEPENDENCIES)
-    cmd = [sys.executable, "-m", "pip", "install", "-q", "-U", *pkg_list]
-    print(f"📦 正在安装 H100 vLLM 推理及网关依赖 ({len(pkg_list)} 个包): {' '.join(pkg_list)}")
+def install_dependencies(packages: list | None = None) -> subprocess.CompletedProcess | None:
+    """使用 subprocess.run 安装 vLLM 与网关核心依赖（保留实时输出，防止 colab exec 30s 静默超时）。"""
+    if SKIP_PIP_INSTALL:
+        print("⏭️ SKIP_PIP_INSTALL=1，跳过 pip 依赖安装。", flush=True)
+        return None
 
-    result = subprocess.run(cmd, check=False)
-    if result.returncode != 0:
+    pkg_list = list(packages) if packages is not None else list(CORE_DEPENDENCIES)
+    cmd = [sys.executable, "-m", "pip", "install", "-U", "--progress-bar", "off", *pkg_list]
+    print(f"📦 正在安装 H100 vLLM 推理及网关依赖 ({len(pkg_list)} 个包): {' '.join(pkg_list)}", flush=True)
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        print(line, end="", flush=True)
+    proc.wait()
+    if proc.returncode != 0:
         raise RuntimeError(
-            f"❌ 依赖安装失败 (exit code={result.returncode})。"
+            f"❌ 依赖安装失败 (exit code={proc.returncode})。"
             "请检查 Colab 网络连接，或尝试手动运行: "
             f"{' '.join(cmd)}"
         )
 
-    print("✅ 核心依赖安装完成！")
-    return result
+    print("✅ 核心依赖安装完成！", flush=True)
+    return subprocess.CompletedProcess(cmd, proc.returncode)
 
 
 def print_environment_summary() -> dict:

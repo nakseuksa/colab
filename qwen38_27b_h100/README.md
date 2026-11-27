@@ -1,6 +1,6 @@
-# Qwen3.8-27B H100 (80GB) vLLM 满血推理与代码库工作台 Pipeline
+# Qwen3.8-27B H100 (80GB) vLLM 满血推理 Pipeline
 
-本项目专为 **Google Colab 单卡 NVIDIA H100 (80GB HBM3, Hopper `sm_90`)** 打造，将原 `qwen38_27b/` 的进程内 Transformers 串行推理全面升级为 **vLLM 满血推理后端 + 异步并发网关 + 本地高速代码库工作台**，全面释放 Hopper 架构的算力、显存带宽与高并发吞吐潜力。
+本项目专为 **Google Colab 单卡 NVIDIA H100 (80GB HBM3, Hopper `sm_90`)** 打造，将原 `qwen38_27b/` 的进程内 Transformers 推理全面升级为 **vLLM 满血推理后端 + 异步并发 OpenAI 网关 + Tailscale 内网直连服务**，全面释放 Hopper 架构的算力、显存带宽与高并发吞吐潜力。
 
 ---
 
@@ -43,45 +43,32 @@
 
 ---
 
-## 3. Cell 1 ~ Cell 7 执行顺序与端口拓扑
+## 3. Cell 1 ~ Cell 5 执行顺序与端口拓扑
 
 ### 端口与服务拓扑图
 
 ```mermaid
 flowchart LR
-    EXT["外部客户端 (OpenCode / Pi Agent)"] -->|"HTTP :80 (Tailscale 内网)"| TS["Cell 5: Tailscale Serve (:80)"]
+    EXT["本地客户端 (Pi Agent / OpenCode)"] -->|"HTTP :80 (Tailscale 内网)"| TS["Cell 5: Tailscale Serve (:80) + 后台监控守护"]
     TS -->|"反向代理 -> 127.0.0.1:8000"| GW["Cell 4: H100 高并发薄网关 (:8000)"]
     GW -->|"httpx.AsyncClient 连接池 -> 127.0.0.1:8001"| VLLM["Cell 2: vLLM H100 引擎 (:8001)"]
-    WB["Cell 6 / Cell 7: 本地代码库工作台"] -->|"优先直连网关 (:8000, 计入并发与保活)"| GW
-    WB -.->|"若 Cell 4 未启动则自动回退 (:8001)"| VLLM
 ```
 
 ### 执行顺序与各 Cell 职责
 
 1. **Cell 1 (`cell1.py`) — H100 环境初始化与云盘缓存持久化**
-   * 幂等挂载 Google Drive（失败自动降级 `/tmp/colab_wheels`），识别 GPU 架构（预期 H100 `sm_90`）与 Python 版本。
+   * 幂等检测 Google Drive（CLI 模式由 `colab drivemount` 前置完成，未挂载自动降级 `/tmp/colab_wheels`），识别 GPU 架构（预期 H100 `sm_90`）与 Python 版本。
    * 绑定并持久化 `TRITON_CACHE_DIR`、`VLLM_CACHE_ROOT`、`TORCHINDUCTOR_CACHE_DIR` 到云盘（按 `sm_{arch}_{py_tag}` 隔离），启用 `HF_HUB_ENABLE_HF_TRANSFER=1`。
    * 安装 `vllm`、`transformers`、`accelerate`、`hf_transfer`、`qwen-vl-utils`、`openai`、`httpx`、`fastapi`、`uvicorn`、`sse-starlette`。
 2. **Cell 2 (`cell2.py`) — 启动 vLLM 满血 H100 后台服务 (`127.0.0.1:8001`)**
-   * 配置 `MODEL_PRECISION` (`"bf16"` / `"fp8"`)、`KV_CACHE_DTYPE` (`"fp8"`) 与 `ENABLE_MTP_SPECULATIVE` (`True`)。
+   * 支持通过环境变量或顶部变量配置 `MODEL_PRECISION` (`"bf16"` / `"fp8"`)、`KV_CACHE_DTYPE` (`"fp8"`) 与 `ENABLE_MTP_SPECULATIVE`。
    * 幂等清理旧端口残留进程并拉起 `vllm serve`（日志写入 `/tmp/vllm_server.log`），等待 `/health` 就绪并完成轻量 Warmup，导出 `VLLM_BASE_URL`、`SERVED_MODEL_NAME` 等契约变量。
 3. **Cell 3 (`cell3.py`) — 快速流式连通性与吞吐测速（可选）**
-   * 默认 `RUN_SANITY_TEST = False` 便于一键“全部运行”；手动开启或调用 `chat_qwen38(...)` 可实时查看 TTFT、思考/正文分离流式输出与 `tok/s`。
+   * 默认 `RUN_SANITY_TEST = False`；CLI 可通过 `--env RUN_SANITY_TEST=1` 开启，实时查看 TTFT、思考/正文分离流式输出与 `tok/s`。
 4. **Cell 4 (`cell4.py`) — 启动 OpenAI 兼容高并发薄代理网关 (`127.0.0.1:8000`)**
-   * 无锁异步转发至 vLLM `8001`，兼容 OpenCode / Pi Agent 的 `developer` 角色、`image_url` 多模态、`reasoning_effort` 映射、`reasoning` -> `reasoning_content` 补齐、SSE `: keep-alive` 心跳与断连自动中止。
-   * 暴露 `GATEWAY_BASE_URL`、`h100_gateway_tracker` 与 `LAST_API_REQUEST_TIME`。
-5. **Cell 5 (`cell5.py`) — Tailscale 内网固定域名暴露与保活守护（若需远程接入）**
-   * 若仅在 Colab 内使用 Cell 6/7 代码库工作台，**可跳过 Cell 5** 直接运行 Cell 6；若需给本地电脑上的 OpenCode / Pi Agent 提供 API，则运行 Cell 5 暴露 `http://colab-llm.<tailnet>/v1`。
-   * 综合 `h100_gateway_tracker.active_sessions` 与 vLLM `/v1/metrics`（`running + waiting` 请求数）、`nvidia-smi` 真实显存占用进行监控；闲置超时（默认 120 分钟）前先优雅关闭 `VLLM_PROCESS` 与 `uvicorn_server` 再释放运行时。
-6. **Cell 6 (`cell6.py`) — 本地高速代码库同步与工作台引擎注册**
-   * 在顶部修改 `DRIVE_REPO_PATH`（支持普通目录或 `.zip` / `.tar.gz` 压缩包），将源码多线程增量过滤同步至 `/content/local_codebase/`（跳过 `.git`、`node_modules`、二进制和大文件）。
-   * 若 `DRIVE_REPO_PATH` 保持默认占位路径且不存在，会友好提示而不会中断 `ask_qwen` 等核心函数注册。
-7. **Cell 7 (`cell7.py`) — 交互式代码库深度分析入口**
-   * 支持三种模式：
-     * `MODE = "agent"`：挂载只读工具（`list_dir` / `find_files` / `grep_search` / `read_file`），配合 vLLM Prefix Caching 自主多轮精读源码。
-     * `MODE = "pack"`：按 `FILES` 通配符与目录树一次性打包源码投喂。
-     * `MODE = "chat"`：结合 `KEEP_HISTORY = True` 或 `CONTEXT_MDS` 进行多轮方案追问。
-   * 所有输出均自动剥离思考过程与工具标签，保存为纯净 `.md` 文件并容错同步至 Google Drive。
+   * 无锁异步转发至 vLLM `8001`，兼容 Pi Agent / OpenCode 的 `developer` 角色、`image_url` 多模态、`reasoning_effort` 映射、`reasoning` -> `reasoning_content` 补齐、SSE `: keep-alive` 心跳、断连自动中止及可选 `COLAB_API_KEY` 鉴权。
+5. **Cell 5 (`cell5.py`) — Tailscale 内网固定域名暴露与非阻塞后台守护**
+   * 拉起 Tailscale 暴露 `http://colab-llm.<tailnet>/v1`，在后台 daemon 线程中持续监控网关并发、vLLM `/v1/metrics`、vLLM 健康状态与 `nvidia-smi` 显存并写入 `/tmp/colab_keepalive_status.json`，主命令立即退出不阻塞 kernel。
 
 ---
 

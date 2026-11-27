@@ -1,16 +1,18 @@
 """Cell 3: H100 vLLM 快速流式测试与首字延迟 (TTFT) / 吞吐测速工具。"""
 
+import os
 import json
 import time
 import urllib.request
 import httpx
 
-# 设为 False 可在点击“全部运行”时跳过自测直接启动网关；需要交互测试时改为 True
-RUN_SANITY_TEST = False
+# 设为 False 可在点击“全部运行”时跳过自测直接启动网关；CLI 可通过 --env RUN_SANITY_TEST=1 开启
+RUN_SANITY_TEST = os.environ.get("RUN_SANITY_TEST", "0").strip().lower() in ("1", "true", "yes")
 
-DEFAULT_VLLM_BASE_URL = globals().get("VLLM_BASE_URL", "http://127.0.0.1:8001/v1")
-DEFAULT_GATEWAY_BASE_URL = globals().get("GATEWAY_BASE_URL", "http://127.0.0.1:8000/v1")
-DEFAULT_MODEL_NAME = globals().get("SERVED_MODEL_NAME", "Qwen/Qwen3.8-27B")
+DEFAULT_VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL") or globals().get("VLLM_BASE_URL", "http://127.0.0.1:8001/v1")
+DEFAULT_GATEWAY_BASE_URL = os.environ.get("GATEWAY_BASE_URL") or globals().get("GATEWAY_BASE_URL", "http://127.0.0.1:8000/v1")
+DEFAULT_MODEL_NAME = os.environ.get("SERVED_MODEL_NAME") or globals().get("SERVED_MODEL_NAME", "Qwen/Qwen3.8-27B")
+DEFAULT_API_KEY = os.environ.get("COLAB_API_KEY") or os.environ.get("OPENAI_API_KEY") or "sk-colab"
 
 
 def resolve_chat_base_url(base_url: str | None = None) -> str:
@@ -106,7 +108,7 @@ def chat_qwen38(
             "POST",
             f"{endpoint_base}/chat/completions",
             json=payload,
-            headers={"Authorization": "Bearer sk-colab"},
+            headers={"Authorization": f"Bearer {DEFAULT_API_KEY}"},
         ) as resp:
             if resp.status_code >= 400:
                 err_body = resp.read().decode("utf-8", errors="replace")
@@ -185,7 +187,8 @@ def chat_qwen38(
 
 if __name__ == "__main__" and RUN_SANITY_TEST:
     _ = chat_qwen38(
-        prompt="你好，请用一句话介绍你自己，并说明你运行在什么硬件推理栈上。",
-        enable_thinking=True,
-        reasoning_effort="low",
+        prompt=os.environ.get("SANITY_PROMPT", "你好，请用一句话介绍你自己，并说明你运行在什么硬件推理栈上。"),
+        enable_thinking=os.environ.get("ENABLE_THINKING", "1").strip().lower() not in ("0", "false", "no"),
+        reasoning_effort=os.environ.get("REASONING_EFFORT", "low"),
+        max_new_tokens=int(os.environ.get("MAX_NEW_TOKENS", "2048")),
     )

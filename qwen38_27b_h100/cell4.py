@@ -44,27 +44,33 @@ logging.getLogger("uvicorn.error").setLevel(logging.CRITICAL)
 # ==========================================================
 # 0. 全局共享契约与网关配置
 # ==========================================================
-GATEWAY_HOST = "0.0.0.0"
-GATEWAY_PORT = 8000
+GATEWAY_HOST = os.environ.get("GATEWAY_HOST", "0.0.0.0")
+GATEWAY_PORT = int(os.environ.get("GATEWAY_PORT", "8000"))
 GATEWAY_BASE_URL = f"http://127.0.0.1:{GATEWAY_PORT}/v1"
 
-VLLM_INTERNAL_PORT = int(globals().get("VLLM_INTERNAL_PORT", 8001))
-VLLM_BASE_URL = str(globals().get("VLLM_BASE_URL", f"http://127.0.0.1:{VLLM_INTERNAL_PORT}/v1")).rstrip("/")
-SERVED_MODEL_NAME = str(globals().get("SERVED_MODEL_NAME", "Qwen/Qwen3.8-27B"))
-ACTIVE_MODEL_ID = str(globals().get("ACTIVE_MODEL_ID", SERVED_MODEL_NAME))
-MODEL_PRECISION = str(globals().get("MODEL_PRECISION", "bf16"))
+VLLM_INTERNAL_PORT = int(os.environ.get("VLLM_INTERNAL_PORT") or globals().get("VLLM_INTERNAL_PORT", 8001))
+VLLM_BASE_URL = str(
+    os.environ.get("VLLM_BASE_URL") or globals().get("VLLM_BASE_URL", f"http://127.0.0.1:{VLLM_INTERNAL_PORT}/v1")
+).rstrip("/")
+SERVED_MODEL_NAME = str(os.environ.get("SERVED_MODEL_NAME") or globals().get("SERVED_MODEL_NAME", "Qwen/Qwen3.8-27B"))
+ACTIVE_MODEL_ID = str(os.environ.get("ACTIVE_MODEL_ID") or globals().get("ACTIVE_MODEL_ID", SERVED_MODEL_NAME))
+MODEL_PRECISION = str(os.environ.get("MODEL_PRECISION") or globals().get("MODEL_PRECISION", "bf16"))
+REQUIRED_API_KEY = os.environ.get("COLAB_API_KEY", "").strip()
 
-DEFAULT_REASONING_EFFORT = "medium"
-FORCE_XHIGH_WHEN_THINKING = False
-MIN_THINKING_MAX_TOKENS = 16384
-MIN_XHIGH_MAX_TOKENS = 32768
+DEFAULT_REASONING_EFFORT = os.environ.get("DEFAULT_REASONING_EFFORT", "medium")
+FORCE_XHIGH_WHEN_THINKING = os.environ.get("FORCE_XHIGH_WHEN_THINKING", "0").strip().lower() in ("1", "true", "yes")
+MIN_THINKING_MAX_TOKENS = int(os.environ.get("MIN_THINKING_MAX_TOKENS", "16384"))
+MIN_XHIGH_MAX_TOKENS = int(os.environ.get("MIN_XHIGH_MAX_TOKENS", "32768"))
 SSE_KEEPALIVE_INTERVAL = 2.5
 
 TAG_THINK_OPEN = "<" + "think>"
 TAG_THINK_CLOSE = "</" + "think>"
 REGEX_THINK_BLOCK = re.compile(re.escape(TAG_THINK_OPEN) + r"(.*?)" + re.escape(TAG_THINK_CLOSE), flags=re.DOTALL)
 REGEX_MAX_CTX_LEN = re.compile(r"maximum context length is (\d+) tokens", flags=re.IGNORECASE)
-REGEX_PROMPT_TOKENS_IN_ERR = re.compile(r"(\d+)\s+in the (?:messages|input)", flags=re.IGNORECASE)
+REGEX_PROMPT_TOKENS_IN_ERR = re.compile(
+    r"(?:(\d+)\s+in the (?:messages|input)|(?:has|passed)\s+(\d+)\s+input tokens|prompt\s*\((\d+)\s+tokens\))",
+    flags=re.IGNORECASE,
+)
 
 if "LAST_API_REQUEST_TIME" not in globals():
     LAST_API_REQUEST_TIME = time.time()
@@ -263,13 +269,18 @@ def normalize_chat_request_payload(
 
     payload["chat_template_kwargs"] = existing_kwargs
 
-    req_max_tokens = payload.get("max_tokens") or payload.pop("max_completion_tokens", None) or 16384
-    payload.pop("max_completion_tokens", None)
-    if enable_thinking:
-        min_tok = min_xhigh_max_tokens if reasoning_effort == "xhigh" else min_thinking_max_tokens
-        payload["max_tokens"] = max(int(req_max_tokens), int(min_tok))
+    raw_req_max_tokens = payload.get("max_tokens")
+    if raw_req_max_tokens is None:
+        raw_req_max_tokens = payload.pop("max_completion_tokens", None)
     else:
-        payload["max_tokens"] = int(req_max_tokens)
+        payload.pop("max_completion_tokens", None)
+
+    req_max_tokens = int(raw_req_max_tokens) if raw_req_max_tokens is not None else 16384
+    if enable_thinking and (raw_req_max_tokens is None or req_max_tokens > 256):
+        min_tok = min_xhigh_max_tokens if reasoning_effort == "xhigh" else min_thinking_max_tokens
+        payload["max_tokens"] = max(req_max_tokens, int(min_tok))
+    else:
+        payload["max_tokens"] = req_max_tokens
 
     # 填充 Qwen3.8 官方推荐默认采样参数（绝不覆盖客户端显式传入值）
     if enable_thinking:
@@ -365,7 +376,10 @@ def compute_clamped_max_tokens_from_400(
         return None
 
     max_len = int(m_ctx.group(1))
-    prompt_tok = int(m_prompt.group(1))
+    prompt_tok_str = next((g for g in m_prompt.groups() if g is not None), None)
+    if prompt_tok_str is None:
+        return None
+    prompt_tok = int(prompt_tok_str)
     available = max_len - prompt_tok - int(safety_margin)
     if available >= 128 and available < int(current_max_tokens):
         return available
@@ -397,10 +411,18 @@ def create_gateway_app():
     fastapi_app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
-        allow_credentials=True,
+        allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    def _check_api_key(request: Request):
+        if not REQUIRED_API_KEY:
+            return None
+        auth_header = request.headers.get("authorization", "")
+        if auth_header == f"Bearer {REQUIRED_API_KEY}":
+            return None
+        return JSONResponse({"error": {"message": "Unauthorized: invalid API key"}}, status_code=401)
 
     async def get_client() -> httpx.AsyncClient:
         client = getattr(fastapi_app.state, "http_client", None)
@@ -413,6 +435,9 @@ def create_gateway_app():
 
     @fastapi_app.post("/v1/chat/completions")
     async def chat_completions(request: Request):
+        auth_err = _check_api_key(request)
+        if auth_err is not None:
+            return auth_err
         globals()["LAST_API_REQUEST_TIME"] = time.time()
         body = await request.json()
         requested_model = body.get("model") or SERVED_MODEL_NAME
@@ -525,6 +550,7 @@ def create_gateway_app():
                                 f"{normalized_payload['max_tokens']} -> {clamped} 并透明重试..."
                             )
                             normalized_payload["max_tokens"] = clamped
+                            err_text_400 = None
                             continue
                     break
 

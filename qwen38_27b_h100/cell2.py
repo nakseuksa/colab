@@ -10,27 +10,27 @@ import urllib.request
 import urllib.error
 
 # ==========================================================
-# 0. 核心显式配置区（按需一键切换 BF16 / FP8 与 MTP 投机解码）
+# 0. 核心显式配置区（支持环境变量覆写，按需一键切换 BF16 / FP8 与 MTP 投机解码）
 # ==========================================================
-MODEL_PRECISION = "bf16"  # 默认 "bf16" (原生无损 Qwen/Qwen3.8-27B)；一键改为 "fp8" (Qwen/Qwen3.8-27B-FP8)
+MODEL_PRECISION = os.environ.get("MODEL_PRECISION", "bf16").strip().lower()
 MODEL_ID_MAP = {
-    "bf16": "Qwen/Qwen3.8-27B",
-    "fp8": "Qwen/Qwen3.8-27B-FP8",
+    "bf16": os.environ.get("MODEL_ID_BF16", "Qwen/Qwen3.8-27B"),
+    "fp8": os.environ.get("MODEL_ID_FP8", "Qwen/Qwen3.8-27B-FP8"),
 }
-SERVED_MODEL_NAME = "Qwen/Qwen3.8-27B"  # 对外统一模型名，客户端无需修改配置
+SERVED_MODEL_NAME = os.environ.get("SERVED_MODEL_NAME", "Qwen/Qwen3.8-27B")
 
-VLLM_HOST = "127.0.0.1"
-VLLM_INTERNAL_PORT = 8001
+VLLM_HOST = os.environ.get("VLLM_HOST", "127.0.0.1")
+VLLM_INTERNAL_PORT = int(os.environ.get("VLLM_INTERNAL_PORT", "8001"))
 VLLM_BASE_URL = f"http://{VLLM_HOST}:{VLLM_INTERNAL_PORT}/v1"
 
-ENABLE_MTP_SPECULATIVE = True
-MTP_NUM_SPECULATIVE_TOKENS = 3
+ENABLE_MTP_SPECULATIVE = os.environ.get("ENABLE_MTP_SPECULATIVE", "1").strip().lower() not in ("0", "false", "no")
+MTP_NUM_SPECULATIVE_TOKENS = int(os.environ.get("MTP_NUM_SPECULATIVE_TOKENS", "3"))
 
-KV_CACHE_DTYPE = "fp8"  # H100 sm_90 默认 FP8 KV Cache；非 sm_90/sm_100+ 自动回退 "auto"，可手动改 "auto"
-MAX_MM_IMAGES_PER_PROMPT = 8
+KV_CACHE_DTYPE = os.environ.get("KV_CACHE_DTYPE", "fp8").strip().lower()
+MAX_MM_IMAGES_PER_PROMPT = int(os.environ.get("MAX_MM_IMAGES_PER_PROMPT", "8"))
 
-VLLM_LOG_PATH = "/tmp/vllm_server.log"
-STARTUP_TIMEOUT_SECONDS = 600
+VLLM_LOG_PATH = os.environ.get("VLLM_LOG_PATH", "/tmp/vllm_server.log")
+STARTUP_TIMEOUT_SECONDS = int(os.environ.get("STARTUP_TIMEOUT_SECONDS", "600"))
 # ==========================================================
 
 VLLM_PROCESS = globals().get("VLLM_PROCESS", None)
@@ -156,20 +156,19 @@ def build_vllm_serve_cmd(
 
 
 def read_hf_token() -> str | None:
-    """安全读取 HF_TOKEN（Colab Secrets 优先，其次环境变量），禁止硬编码。"""
-    token = None
+    """安全读取 HF_TOKEN（环境变量优先以适配 Colab CLI，其次回退 Colab Secrets），禁止硬编码。"""
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if token and str(token).strip():
+        return str(token).strip()
+
     try:
         from google.colab import userdata
 
         token = userdata.get("HF_TOKEN")
+        if token and str(token).strip():
+            return str(token).strip()
     except Exception:
         pass
-
-    if not token:
-        token = os.environ.get("HF_TOKEN")
-
-    if token and str(token).strip():
-        return str(token).strip()
     return None
 
 
@@ -226,14 +225,31 @@ def cleanup_existing_vllm_process(port: int, existing_proc=None) -> None:
         subprocess.run(["fuser", "-k", f"{port}/tcp"], capture_output=True, check=False)
 
     current_pid = os.getpid()
-    for pid in pids:
-        if pid != current_pid:
+    target_pids = [pid for pid in pids if pid != current_pid]
+    for pid in target_pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+    if target_pids:
+        deadline = time.time() + 10.0
+        alive = set(target_pids)
+        while alive and time.time() < deadline:
+            for pid in list(alive):
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    alive.discard(pid)
+            if alive:
+                time.sleep(0.5)
+        for pid in alive:
             try:
-                os.kill(pid, 15)
-            except Exception:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
                 pass
-    if pids:
-        time.sleep(2.0)
+        if alive:
+            time.sleep(1.0)
 
 
 def read_log_tail(log_path: str, max_lines: int = 40) -> str:
@@ -253,9 +269,13 @@ def wait_for_vllm_ready(
     health_url: str,
     timeout_seconds: int = STARTUP_TIMEOUT_SECONDS,
     poll_interval: float = 2.0,
+    log_path: str = VLLM_LOG_PATH,
+    progress_interval: float = 15.0,
 ) -> tuple[bool, str]:
-    """轮询 vLLM /health 端点直至就绪，或检测到进程提前退出。"""
-    deadline = time.time() + timeout_seconds
+    """轮询 vLLM /health 端点直至就绪，定期打印进度心跳防止 Colab CLI 静默超时。"""
+    t0 = time.time()
+    deadline = t0 + timeout_seconds
+    last_report = t0
     last_err = ""
     while time.time() < deadline:
         exit_code = proc.poll()
@@ -268,6 +288,14 @@ def wait_for_vllm_ready(
                     return True, "ok"
         except Exception as exc:
             last_err = str(exc)
+
+        now = time.time()
+        if now - last_report >= progress_interval:
+            elapsed = now - t0
+            tail = read_log_tail(log_path, max_lines=1)
+            short_tail = (tail[:110] + "...") if len(tail) > 110 else tail
+            print(f"⏳ 等待 vLLM 就绪 ({elapsed:.0f}s/{timeout_seconds}s) | 最新日志: {short_tail}", flush=True)
+            last_report = now
 
         time.sleep(poll_interval)
 

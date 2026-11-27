@@ -1,6 +1,9 @@
+// ⚠️ 仅用于 Google Colab 网页端浏览器控制台（DevTools）。
+// 使用 google-colab-cli 时无需本脚本（CLI 由后端根据活跃内核自动保活）。
+
 function keepAlive() {
     console.log("🟢 [Colab Keep-Alive] 正在触发活跃点击...");
-    
+
     // 尝试寻找 Colab 的连接按钮并点击
     const connectButton = document.querySelector("colab-connect-button");
     if (connectButton && connectButton.shadowRoot) {
@@ -10,7 +13,7 @@ function keepAlive() {
             return;
         }
     }
-    
+
     // 备用方案：点击顶部工具栏的连接状态
     const toolbarBtn = document.querySelector("#top-toolbar > colab-connect-button");
     if (toolbarBtn) {
