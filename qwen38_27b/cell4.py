@@ -468,6 +468,11 @@ def parse_qwen_output(raw_text: str, prompt_opened_think: bool = True, parse_too
         if think_part:
             reasoning_content = think_part
         body_text = rest_part
+    elif TAG_THINK_OPEN in raw_text:
+        before_think, unclosed_think = raw_text.split(TAG_THINK_OPEN, 1)
+        if unclosed_think.strip():
+            reasoning_content = unclosed_think.strip()
+        body_text = before_think
     elif prompt_opened_think:
         reasoning_content = REGEX_THINK_LEADING.sub("", raw_text).strip()
         body_text = ""
